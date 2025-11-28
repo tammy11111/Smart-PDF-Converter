@@ -13,20 +13,20 @@ import os
 import re
 
 # --- 網頁設定 ---
-st.set_page_config(page_title="PDF 轉 PPT (段落增強版)", layout="wide")
+st.set_page_config(page_title="PDF 轉 PPT (圖片保護版)", layout="wide")
 
-st.title("📄 PDF 轉 PPT：段落增強 + 智慧過濾")
+st.title("📄 PDF 轉 PPT：圖片保護 + 智慧排版")
 st.markdown("""
-**本次修正：**
-1. **段落敏感度提升**：即使只有一行，只要字數夠多或寬度夠寬，就會被視為內文拆解。
-2. **繞圖排版支援**：主要內文即使緊貼圖片，也會被拆解，不會被誤判為圖說。
-3. **小字保護**：只有「短小且緊貼圖片」的文字才會保留在背景。
+**本次修正邏輯：**
+1. **圖片禁區優先**：凡是壓在圖片上、或緊鄰圖片的文字，一律保留在背景（避免拆到圖表文字）。
+2. **清單特權**：只有條列式清單 (`•`, `1.`) 即使靠近圖片也會被拆解。
+3. **內文識別**：在空白區域的長段落與標題，自動轉為可編輯文字。
 """)
 
 # --- 參數設定 ---
 OCR_LANG = 'chi_tra+eng'
 TARGET_DPI = 300
-BLACK_THRESHOLD = 100 #稍微放寬黑色的標準，避免深灰字被漏掉
+BLACK_THRESHOLD = 80
 
 # --- 核心功能 ---
 
@@ -36,27 +36,34 @@ def get_large_image_mask(image_np, text_boxes):
     gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # 把文字塗黑
+    # 1. 先把文字塗黑 (消除文字對圖形偵測的干擾)
     for (tx, ty, tw, th) in text_boxes:
         cv2.rectangle(binary, (max(0, tx-5), max(0, ty-5)), (tx+tw+5, ty+th+5), 0, -1)
         
+    # 2. 膨脹處理 (讓破碎的線條連成區塊)
     kernel = np.ones((5,5), np.uint8)
     dilated = cv2.dilate(binary, kernel, iterations=2)
+    
+    # 3. 找輪廓
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     danger_zone_mask = np.zeros((img_h, img_w), dtype=np.uint8)
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         area = w * h
-        # 面積門檻：頁面的 2%
+        # 面積門檻：頁面的 2% 以上才算「圖」
         if area > (img_w * img_h * 0.02):
             cv2.rectangle(danger_zone_mask, (x, y), (x+w, y+h), 255, -1)
             
-    buffer_kernel = np.ones((10, 10), np.uint8) # buffer 稍微縮小一點，避免誤傷主文
+    # 4. 禁區擴張 (Buffer)
+    # 這裡稍微擴大一點，確保緊貼圖片的標籤也能被保護到
+    buffer_kernel = np.ones((10, 10), np.uint8) 
     danger_zone_mask = cv2.dilate(danger_zone_mask, buffer_kernel, iterations=1)
+    
     return danger_zone_mask
 
 def is_touching_image(x, y, w, h, danger_mask):
+    """檢查文字是否踩到禁區"""
     roi = danger_mask[y:y+h, x:x+w]
     return cv2.countNonZero(roi) > 0
 
@@ -157,7 +164,7 @@ def process_pdf(uploaded_file):
                 paragraphs[key]['heights'].append(h)
                 paragraphs[key]['line_nums'].add(data['line_num'][j])
 
-        # 2. 禁區遮罩與最大字體
+        # 2. 產生圖片禁區 (Danger Zone)
         danger_mask = get_large_image_mask(img_np, all_text_boxes)
         
         max_font_size_on_page = 0
@@ -179,50 +186,38 @@ def process_pdf(uploaded_file):
             p_w = max_x2 - min_x
             p_h = max_y2 - min_y
             
-            # NotebookLM 移除
+            # NotebookLM 移除 (最優先)
             if "notebook" in full_text.lower() and min_y > (img_h * 0.8):
                 bg_color = get_smart_median_color(img_np, min_x, min_y, p_w, p_h)
                 cv2.rectangle(clean_bg_img, (min_x-2, min_y-2), (max_x2+2, max_y2+2), bg_color, -1)
                 continue 
 
-            # 特徵判斷
+            # 特徵分析
             is_bullet = is_list_item(full_text)
             is_black = is_text_black(img_np, min_x, min_y, p_w, p_h)
             is_title = (p_data['calculated_size'] >= max_font_size_on_page - 2) and (max_font_size_on_page > 14)
-            
-            # --- 段落增強判斷 (修正點) ---
-            # 只要超過 2 行 -> 是段落
             is_multiline = len(p_data['line_nums']) >= 2
-            # 就算只有 1 行，如果字數夠多 (例如 > 10 個中文字或單字) -> 是段落
-            word_count = len(full_text) 
-            is_long_text = word_count > 10
-            # 就算只有 1 行，如果寬度超過版面的 30% -> 是段落
+            is_long_text = len(full_text) > 10
             is_wide_text = p_w > (img_w * 0.3)
             
-            # 總合：是否為「實質內文」
-            is_content = is_multiline or is_long_text or is_wide_text
-
+            # 是否碰到圖片
             is_touching_img = is_touching_image(min_x, min_y, p_w, p_h, danger_mask)
             
+            # 決定是否拆解
             should_extract = False
             
-            # --- 最終決策樹 ---
             if is_bullet:
-                should_extract = True # 清單無敵，必拆
-            elif is_title:
-                should_extract = True # 標題無敵，必拆
+                # 規則 1: 清單特權 (就算碰到圖片也拆，因為清單通常不是圖片標籤)
+                should_extract = True
+            
+            elif is_touching_img:
+                # 規則 2: 圖片禁區保護 (非清單，只要碰到圖，絕對不拆)
+                should_extract = False
+            
             elif is_black:
-                if is_content:
-                    # 如果是實質內文 (長句/寬句/多行)，即使碰到圖片也要拆
-                    # 因為通常主文排版都會貼著圖片，不能因為稍微碰到就不拆
+                # 規則 3: 安全區的文字 (沒碰到圖 + 黑色)
+                if is_title or is_multiline or is_long_text or is_wide_text:
                     should_extract = True
-                else:
-                    # 如果是「短、窄、單行」的黑字
-                    # 這時候才檢查有沒有碰到圖片
-                    # 碰到圖片 -> 圖說 (不拆)
-                    # 沒碰到圖片 -> 可能是頁碼或雜訊 (這裡選擇不拆，保持乾淨)
-                    if not is_touching_img:
-                        pass 
             
             if should_extract:
                 bg_color = get_smart_median_color(img_np, min_x, min_y, p_w, p_h)
