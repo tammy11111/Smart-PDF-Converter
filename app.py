@@ -11,56 +11,23 @@ from PIL import Image
 import io
 
 # --- 網頁設定 ---
-st.set_page_config(page_title="PDF 轉 PPT (旗艦版)", layout="wide")
+st.set_page_config(page_title="PDF 轉 PPT (強力去字版)", layout="wide")
 
-st.title("📄 PDF 轉 PPT：智慧修補 + 排版還原")
+st.title("📄 PDF 轉 PPT：強力去字 + 智慧排版")
 st.markdown("""
-**旗艦版功能：**
-1. **色塊修補**：使用「區域中位數」吸色，背景修補最乾淨，無模糊痕跡。
-2. **原字級還原**：精確計算像素與 PPT 點數轉換。
-3. **智慧標題**：掃描整頁，僅將「字體最大」的標題設為粗體。
+**本次更新重點：**
+1. **全域遮罩膨脹 (Mask Dilation)**：自動將文字選取範圍「外擴」，確保 g, y, j 等字母尾巴完全清除。
+2. **一次性修補**：避免重複塗抹造成的背景髒污。
 """)
 
 # --- 參數設定 ---
 OCR_LANG = 'chi_tra+eng'
 TARGET_DPI = 300
 
-# --- 核心功能函式 ---
-
-def get_smart_median_color(image_np, x, y, w, h):
-    """
-    區域中位數吸色：
-    吸取文字框周圍區域的中位數顏色，
-    有效抵抗雜訊，抓出最準確的背景色。
-    """
-    img_h, img_w, _ = image_np.shape
-    
-    # 優先吸取文字左邊 10px 寬的區域
-    sample_w = 10
-    sample_h = min(h, 10)
-    
-    x1 = max(0, x - sample_w)
-    x2 = x
-    y1 = y
-    y2 = min(img_h, y + sample_h)
-    
-    # 如果左邊沒空間，改吸上面
-    if (x2 - x1) < 2:
-        x1 = x
-        x2 = min(img_w, x + sample_w)
-        y1 = max(0, y - 5)
-        y2 = y
-        
-    try:
-        roi = image_np[y1:y2, x1:x2]
-        if roi.size == 0: return (255, 255, 255)
-        median_color = np.median(roi, axis=(0, 1))
-        return (int(median_color[0]), int(median_color[1]), int(median_color[2]))
-    except:
-        return (255, 255, 255)
+# --- 核心功能 ---
 
 def get_font_size_float(heights_px):
-    """計算字體大小 (浮點數)"""
+    """計算字體大小"""
     if not heights_px: return 12.0
     avg_h_px = np.mean(heights_px)
     size_pt = (avg_h_px / TARGET_DPI) * 72 * 0.85
@@ -78,14 +45,14 @@ def process_pdf(uploaded_file):
     status_text = st.empty()
     progress_bar = st.progress(0)
     
-    status_text.text("正在將 PDF 轉為高解析圖片 (300 DPI)...")
+    status_text.text("正在轉檔與分析 (300 DPI)...")
     images = convert_from_bytes(bytes_data, dpi=TARGET_DPI)
     total_pages = len(images)
     
     for i, img in enumerate(images):
-        status_text.text(f"🔄 正在處理第 {i+1} / {total_pages} 頁 (分析排版 -> 修補背景 -> 重建文字)...")
+        status_text.text(f"🔄 正在處理第 {i+1} / {total_pages} 頁...")
         
-        # 準備影像
+        # 準備影像 (OpenCV BGR)
         img_np = np.array(img)
         img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
         img_h, img_w, _ = img_np.shape
@@ -96,9 +63,10 @@ def process_pdf(uploaded_file):
         paragraphs = {}
         n_boxes = len(data['text'])
         
-        # 複製背景圖來修補
-        clean_bg_img = img_np.copy()
+        # 建立一個「全頁遮罩」 (一開始全黑)
+        full_mask = np.zeros(img_np.shape[:2], dtype=np.uint8)
         
+        # --- 第一階段：標記所有文字位置 ---
         for j in range(n_boxes):
             conf = int(data['conf'][j])
             text = data['text'][j].strip()
@@ -106,14 +74,10 @@ def process_pdf(uploaded_file):
             if conf > 30 and len(text) > 0:
                 x, y, w, h = data['left'][j], data['top'][j], data['width'][j], data['height'][j]
                 
-                # --- 步驟 A: 吸色與修補 ---
-                bg_color = get_smart_median_color(img_np, x, y, w, h)
+                # 在遮罩上畫白色矩形 (標記這裡是文字)
+                cv2.rectangle(full_mask, (x, y), (x+w, y+h), 255, -1)
                 
-                # 擴張遮罩 (padding=3) 確保蓋住邊緣
-                pad = 3
-                cv2.rectangle(clean_bg_img, (x-pad, y-pad), (x+w+pad, y+h+pad), bg_color, -1)
-                
-                # --- 步驟 B: 收集資料 ---
+                # 收集資料供後續 PPT 使用
                 key = (data['block_num'][j], data['par_num'][j])
                 if key not in paragraphs:
                     paragraphs[key] = {'text_list': [], 'rects': [], 'heights': []}
@@ -122,7 +86,21 @@ def process_pdf(uploaded_file):
                 paragraphs[key]['rects'].append((x, y, w, h))
                 paragraphs[key]['heights'].append(h)
         
-        # --- 步驟 C: 找出本頁最大字體 ---
+        # --- 第二階段：遮罩膨脹 (Dilation) - 關鍵步驟！ ---
+        # 這一步會把剛剛畫的所有白框「變胖」，確保蓋住文字邊緣的殘影
+        # kernel 設為 3x3，膨脹 2 次，相當於往外擴張約 4-6 像素
+        kernel = np.ones((3, 3), np.uint8)
+        dilated_mask = cv2.dilate(full_mask, kernel, iterations=2)
+        
+        # --- 第三階段：一次性背景修補 ---
+        # 使用 Telea 演算法，根據膨脹後的遮罩進行修補
+        if np.sum(dilated_mask) > 0:
+            # radius=5 (參考周圍 5px 的顏色來補)
+            inpainted_img = cv2.inpaint(img_np, dilated_mask, 5, cv2.INPAINT_TELEA)
+        else:
+            inpainted_img = img_np
+
+        # --- 第四階段：計算最大字體 (智慧標題) ---
         max_font_size_on_page = 0
         for key in paragraphs:
             f_size = get_font_size_float(paragraphs[key]['heights'])
@@ -131,7 +109,7 @@ def process_pdf(uploaded_file):
                 max_font_size_on_page = f_size
         
         # 2. 插入修補後的背景
-        clean_bg_rgb = cv2.cvtColor(clean_bg_img, cv2.COLOR_BGR2RGB)
+        clean_bg_rgb = cv2.cvtColor(inpainted_img, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(clean_bg_rgb)
         img_stream = io.BytesIO()
         pil_img.save(img_stream, format='JPEG', quality=95)
@@ -171,7 +149,6 @@ def process_pdf(uploaded_file):
                     paragraph.font.name = "Arial"
                     paragraph.font.color.rgb = RGBColor(0, 0, 0)
                     
-                    # 智慧加粗判定
                     if (this_font_size >= max_font_size_on_page - 2) and (max_font_size_on_page > 14):
                         paragraph.font.bold = True
                     else:
@@ -181,7 +158,7 @@ def process_pdf(uploaded_file):
         
         progress_bar.progress((i + 1) / total_pages)
 
-    status_text.text("✅ 轉換完成！準備下載...")
+    status_text.text("✅ 轉換完成！")
     ppt_output = io.BytesIO()
     prs.save(ppt_output)
     ppt_output.seek(0)
@@ -194,13 +171,13 @@ if uploaded_file is not None:
     if st.button("🚀 開始轉換"):
         try:
             ppt_file = process_pdf(uploaded_file)
-            st.success("🎉 處理成功！")
+            st.success("🎉 處理成功！背景已強力清除。")
             st.download_button(
                 label="📥 下載 PPTX",
                 data=ppt_file,
-                file_name="Converted_Presentation.pptx",
+                file_name="Clean_Fixed.pptx",
                 mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
             )
         except Exception as e:
-            st.error(f"❌ 發生錯誤：{e}")
-            st.info("💡 提示：請確認 packages.txt 內的 tesseract 依賴是否已正確安裝。")
+            st.error(f"❌ 錯誤：{e}")
+            st.info("💡 如果出現 cv2 錯誤，請確認 requirements.txt 包含 opencv-python-headless。")
