@@ -12,74 +12,55 @@ import io
 import os
 
 # --- 網頁設定 ---
-st.set_page_config(page_title="PDF 轉 PPT (顏色過濾版)", layout="wide")
+st.set_page_config(page_title="PDF 轉 PPT (結構過濾版)", layout="wide")
 
-st.title("📄 PDF 轉 PPT：智慧顏色過濾 + 色塊修補")
+st.title("📄 PDF 轉 PPT：智慧過濾 + 浮水印移除")
 st.markdown("""
-**本次更新重點：**
-1. **顏色過濾**：只有 **「黑色/深灰色」** 的文字會被拆解成可編輯文字。
-2. **保留圖解**：圖片中有顏色的文字（紅/藍/綠等）將自動保留在背景圖上，不會被破壞。
-3. **背景修補**：黑色文字部分依然使用「智慧色塊」蓋除。
+**本次更新邏輯：**
+1. **移除干擾**：自動偵測並塗掉右下角的 "NotebookLM" 字樣。
+2. **智慧拆解**：
+    * **標題** (字體最大) ➝ 拆解為可編輯文字。
+    * **段落** (兩行以上) ➝ 拆解為可編輯文字。
+    * **單行小字** (圖表標籤) ➝ 保留在背景圖，保持版面整潔。
+3. **顏色過濾**：彩色文字依然保留在背景。
 """)
 
 # --- 參數設定 ---
 OCR_LANG = 'chi_tra+eng'
 TARGET_DPI = 300
-# 定義「黑色」的門檻 (RGB 0~255)，數值越小越嚴格(越黑)
-# 設定 80 允許深灰色也被視為內文
 BLACK_THRESHOLD = 80 
 
 # --- 核心功能 ---
 
 def is_text_black(image_np, x, y, w, h):
-    """
-    判斷該區域的文字是否為黑色/深色。
-    原理：
-    1. 切出文字區域。
-    2. 轉灰階並二值化，找出「文字像素」(前景)。
-    3. 計算這些像素在原圖(RGB)中的平均顏色。
-    4. 如果 R, G, B 都小於門檻，認定為黑色文字。
-    """
-    # 邊界檢查
+    """判斷文字是否為黑色"""
     img_h, img_w, _ = image_np.shape
     x = max(0, x); y = max(0, y)
     w = min(w, img_w - x); h = min(h, img_h - y)
-    
     if w <= 0 or h <= 0: return False
 
     roi = image_np[y:y+h, x:x+w]
-    
-    # 轉灰階
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    
-    # 使用 Otsu 二值化找出文字像素 (黑色部分)
-    # THRESH_BINARY_INV: 讓文字變白(255)，背景變黑(0)，方便做遮罩
     _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # 如果找不到文字像素 (可能是全白)，直接回傳 False
-    if cv2.countNonZero(mask) == 0:
-        return False
+    if cv2.countNonZero(mask) == 0: return False
 
-    # 計算遮罩區域內的平均顏色 (B, G, R)
     mean_val = cv2.mean(roi, mask=mask)
     b, g, r = mean_val[0], mean_val[1], mean_val[2]
     
-    # 判斷是否夠黑 (R, G, B 都必須很低)
     if b < BLACK_THRESHOLD and g < BLACK_THRESHOLD and r < BLACK_THRESHOLD:
-        return True # 是黑色文字 -> 拆！
-    else:
-        return False # 是彩色文字 -> 不拆！
+        return True
+    return False
 
 def get_smart_median_color(image_np, x, y, w, h):
     """區域中位數吸色"""
     img_h, img_w, _ = image_np.shape
     sample_w = 10
-    sample_h = min(h, 10)
     
     x1 = max(0, x - sample_w)
     x2 = x
     y1 = y
-    y2 = min(img_h, y + sample_h)
+    y2 = min(img_h, y + min(h, 10))
     
     if (x2 - x1) < 2:
         x1 = x
@@ -119,9 +100,8 @@ def process_pdf(uploaded_file):
     total_pages = len(images)
     
     for i, img in enumerate(images):
-        status_text.text(f"🔄 正在處理第 {i+1} / {total_pages} 頁 (正在過濾彩色文字)...")
+        status_text.text(f"🔄 正在處理第 {i+1} / {total_pages} 頁...")
         
-        # 準備影像
         img_np = np.array(img)
         img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
         img_h, img_w, _ = img_np.shape
@@ -132,9 +112,9 @@ def process_pdf(uploaded_file):
         paragraphs = {}
         n_boxes = len(data['text'])
         
-        # 複製背景圖來修補
         clean_bg_img = img_np.copy()
         
+        # --- 第一階段：收集資料 ---
         for j in range(n_boxes):
             conf = int(data['conf'][j])
             text = data['text'][j].strip()
@@ -142,41 +122,85 @@ def process_pdf(uploaded_file):
             if conf > 30 and len(text) > 0:
                 x, y, w, h = data['left'][j], data['top'][j], data['width'][j], data['height'][j]
                 
-                # --- 關鍵判斷：是黑色文字嗎？ ---
-                if is_text_black(img_np, x, y, w, h):
-                    # 【情況 A：黑色/深色文字】-> 執行「拆解」SOP
-                    
-                    # 1. 吸取背景色
-                    bg_color = get_smart_median_color(img_np, x, y, w, h)
-                    
-                    # 2. 塗掉背景 (pad=2)
-                    pad = 2
-                    cv2.rectangle(clean_bg_img, (x-pad, y-pad), (x+w+pad, y+h+pad), bg_color, -1)
-                    
-                    # 3. 收集資料準備轉文字框
-                    key = (data['block_num'][j], data['par_num'][j])
-                    if key not in paragraphs:
-                        paragraphs[key] = {'text_list': [], 'rects': [], 'heights': []}
-                    
-                    paragraphs[key]['text_list'].append(text)
-                    paragraphs[key]['rects'].append((x, y, w, h))
-                    paragraphs[key]['heights'].append(h)
+                key = (data['block_num'][j], data['par_num'][j])
+                if key not in paragraphs:
+                    paragraphs[key] = {
+                        'text_list': [], 
+                        'rects': [], 
+                        'heights': [], 
+                        'line_nums': set() # 新增：用來計算行數
+                    }
                 
-                else:
-                    # 【情況 B：彩色文字】-> 跳過
-                    # 不塗背景，也不加入 paragraphs
-                    # 這樣它就會留在原本的背景圖上
-                    pass
-        
-        # 2. 計算頁面最大字體 (智慧標題用)
+                paragraphs[key]['text_list'].append(text)
+                paragraphs[key]['rects'].append((x, y, w, h))
+                paragraphs[key]['heights'].append(h)
+                # 收集行號 (line_num)
+                paragraphs[key]['line_nums'].add(data['line_num'][j])
+
+        # --- 第二階段：計算最大字體 (找標題) ---
         max_font_size_on_page = 0
         for key in paragraphs:
             f_size = get_font_size_float(paragraphs[key]['heights'])
             paragraphs[key]['calculated_size'] = f_size
             if f_size > max_font_size_on_page:
                 max_font_size_on_page = f_size
+
+        # --- 第三階段：過濾與處理 ---
+        for key, p_data in paragraphs.items():
+            full_text = " ".join(p_data['text_list'])
+            all_rects = p_data['rects']
+            
+            # 計算段落整體的邊界
+            min_x = min([r[0] for r in all_rects])
+            min_y = min([r[1] for r in all_rects])
+            max_x2 = max([r[0] + r[2] for r in all_rects])
+            max_y2 = max([r[1] + r[3] for r in all_rects])
+            p_w = max_x2 - min_x
+            p_h = max_y2 - min_y
+            
+            # ========================
+            #    過濾邏輯開始
+            # ========================
+
+            # 1.【NotebookLM 移除】
+            # 條件：內容包含 notebook 且位置在頁面下方 20%
+            is_notebook = "notebook" in full_text.lower()
+            is_bottom = min_y > (img_h * 0.8)
+            
+            if is_notebook and is_bottom:
+                # 只塗掉背景，不輸出文字
+                bg_color = get_smart_median_color(img_np, min_x, min_y, p_w, p_h)
+                cv2.rectangle(clean_bg_img, (min_x-2, min_y-2), (max_x2+2, max_y2+2), bg_color, -1)
+                continue # 跳過，不產生文字框
+
+            # 2.【顏色檢查】
+            # 如果不是黑色文字 -> 跳過 (保留彩色文字在圖上)
+            if not is_text_black(img_np, min_x, min_y, p_w, p_h):
+                continue
+
+            # 3.【結構過濾】
+            # 條件 A: 是標題 (字體接近最大值)
+            is_title = (p_data['calculated_size'] >= max_font_size_on_page - 2) and (max_font_size_on_page > 14)
+            # 條件 B: 是段落 (行數 >= 2)
+            is_paragraph = len(p_data['line_nums']) >= 2
+            
+            if is_title or is_paragraph:
+                # 符合拆解條件：執行拆解！
+                
+                # A. 塗掉背景
+                bg_color = get_smart_median_color(img_np, min_x, min_y, p_w, p_h)
+                cv2.rectangle(clean_bg_img, (min_x-2, min_y-2), (max_x2+2, max_y2+2), bg_color, -1)
+                
+                # B. 記錄下來，等下建立 PPT 文字框
+                p_data['should_export'] = True
+                p_data['bbox'] = (min_x, min_y, p_w, p_h)
+            else:
+                # 單行小字 (圖表標籤) -> 跳過 (保留在背景)
+                p_data['should_export'] = False
+
+        # --- 第四階段：產生 PPT ---
         
-        # 3. 插入處理好的背景
+        # 1. 插入處理後的背景
         clean_bg_rgb = cv2.cvtColor(clean_bg_img, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(clean_bg_rgb)
         img_stream = io.BytesIO()
@@ -186,23 +210,21 @@ def process_pdf(uploaded_file):
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         slide.shapes.add_picture(img_stream, 0, 0, width=prs.slide_width, height=prs.slide_height)
         
-        # 4. 貼上文字框 (只會貼上被判定為黑色的文字)
+        # 2. 建立文字框 (只建立有標記 should_export 的)
         scale_x = prs.slide_width / img_w
         scale_y = prs.slide_height / img_h
         
         for key, p_data in paragraphs.items():
+            if not p_data.get('should_export'):
+                continue
+                
+            min_x, min_y, p_w, p_h = p_data['bbox']
             full_text = " ".join(p_data['text_list'])
-            all_rects = p_data['rects']
-            
-            min_x = min([r[0] for r in all_rects])
-            min_y = min([r[1] for r in all_rects])
-            max_x2 = max([r[0] + r[2] for r in all_rects])
-            max_y2 = max([r[1] + r[3] for r in all_rects])
             
             ppt_x = min_x * scale_x
             ppt_y = min_y * scale_y
-            ppt_w = (max_x2 - min_x) * scale_x + Inches(0.15)
-            ppt_h = (max_y2 - min_y) * scale_y
+            ppt_w = p_w * scale_x + Inches(0.15)
+            ppt_h = p_h * scale_y
             
             this_font_size = p_data['calculated_size']
 
@@ -217,6 +239,7 @@ def process_pdf(uploaded_file):
                     paragraph.font.name = "Arial"
                     paragraph.font.color.rgb = RGBColor(0, 0, 0)
                     
+                    # 標題加粗
                     if (this_font_size >= max_font_size_on_page - 2) and (max_font_size_on_page > 14):
                         paragraph.font.bold = True
                     else:
@@ -238,13 +261,12 @@ uploaded_file = st.file_uploader("📂 請上傳 PDF 檔案", type=["pdf"])
 if uploaded_file is not None:
     if st.button("🚀 開始轉換"):
         try:
-            # 自動檔名處理
             original_filename = uploaded_file.name
             file_root, _ = os.path.splitext(original_filename)
             new_filename = f"{file_root}_Fixed.pptx"
 
             ppt_file = process_pdf(uploaded_file)
-            st.success(f"🎉 處理成功！彩色文字已保留，黑色文字已轉換。")
+            st.success(f"🎉 處理成功！")
             
             st.download_button(
                 label=f"📥 下載 {new_filename}",
