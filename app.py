@@ -10,19 +10,17 @@ from pptx.dml.color import RGBColor
 from PIL import Image
 import io
 import os
+import re # 新增正則表達式套件
 
 # --- 網頁設定 ---
-st.set_page_config(page_title="PDF 轉 PPT (結構過濾版)", layout="wide")
+st.set_page_config(page_title="PDF 轉 PPT (清單強化版)", layout="wide")
 
-st.title("📄 PDF 轉 PPT：智慧過濾 + 浮水印移除")
+st.title("📄 PDF 轉 PPT：清單強化 + 智慧過濾")
 st.markdown("""
 **本次更新邏輯：**
-1. **移除干擾**：自動偵測並塗掉右下角的 "NotebookLM" 字樣。
-2. **智慧拆解**：
-    * **標題** (字體最大) ➝ 拆解為可編輯文字。
-    * **段落** (兩行以上) ➝ 拆解為可編輯文字。
-    * **單行小字** (圖表標籤) ➝ 保留在背景圖，保持版面整潔。
-3. **顏色過濾**：彩色文字依然保留在背景。
+1. **清單強制拆解**：只要是 Bullet Point (`•`, `1.`, `-`)，**不論顏色**一律轉為文字。
+2. **干擾移除**：自動塗掉右下角的 "NotebookLM"。
+3. **智慧過濾**：彩色圖表標籤保留在背景，黑色內文與標題轉為文字。
 """)
 
 # --- 參數設定 ---
@@ -31,6 +29,26 @@ TARGET_DPI = 300
 BLACK_THRESHOLD = 80 
 
 # --- 核心功能 ---
+
+def is_list_item(text):
+    """
+    判斷字串是否像是一個條列式清單 (Bullet Point)
+    """
+    text = text.strip()
+    if not text: return False
+    
+    # 1. 常見符號開頭
+    markers = ['•', '●', '○', '▪', '▫', '◆', '◇', '➢', '➣', '➤', '→', '-', '—', '–', '*', '>']
+    if any(text.startswith(m) for m in markers):
+        return True
+        
+    # 2. 數字/字母編號開頭 (例如 "1.", "2)", "A.", "(a)")
+    # 正則表達式：開頭是數字或字母，後面跟著 . 或 )
+    pattern = r'^(\d+|[a-zA-Z])[\.\)]\s+'
+    if re.match(pattern, text):
+        return True
+        
+    return False
 
 def is_text_black(image_np, x, y, w, h):
     """判斷文字是否為黑色"""
@@ -128,13 +146,12 @@ def process_pdf(uploaded_file):
                         'text_list': [], 
                         'rects': [], 
                         'heights': [], 
-                        'line_nums': set() # 新增：用來計算行數
+                        'line_nums': set()
                     }
                 
                 paragraphs[key]['text_list'].append(text)
                 paragraphs[key]['rects'].append((x, y, w, h))
                 paragraphs[key]['heights'].append(h)
-                # 收集行號 (line_num)
                 paragraphs[key]['line_nums'].add(data['line_num'][j])
 
         # --- 第二階段：計算最大字體 (找標題) ---
@@ -145,12 +162,11 @@ def process_pdf(uploaded_file):
             if f_size > max_font_size_on_page:
                 max_font_size_on_page = f_size
 
-        # --- 第三階段：過濾與處理 ---
+        # --- 第三階段：智慧過濾邏輯 ---
         for key, p_data in paragraphs.items():
             full_text = " ".join(p_data['text_list'])
             all_rects = p_data['rects']
             
-            # 計算段落整體的邊界
             min_x = min([r[0] for r in all_rects])
             min_y = min([r[1] for r in all_rects])
             max_x2 = max([r[0] + r[2] for r in all_rects])
@@ -158,49 +174,45 @@ def process_pdf(uploaded_file):
             p_w = max_x2 - min_x
             p_h = max_y2 - min_y
             
-            # ========================
-            #    過濾邏輯開始
-            # ========================
-
             # 1.【NotebookLM 移除】
-            # 條件：內容包含 notebook 且位置在頁面下方 20%
-            is_notebook = "notebook" in full_text.lower()
-            is_bottom = min_y > (img_h * 0.8)
-            
-            if is_notebook and is_bottom:
-                # 只塗掉背景，不輸出文字
+            if "notebook" in full_text.lower() and min_y > (img_h * 0.8):
                 bg_color = get_smart_median_color(img_np, min_x, min_y, p_w, p_h)
                 cv2.rectangle(clean_bg_img, (min_x-2, min_y-2), (max_x2+2, max_y2+2), bg_color, -1)
-                continue # 跳過，不產生文字框
+                continue 
 
-            # 2.【顏色檢查】
-            # 如果不是黑色文字 -> 跳過 (保留彩色文字在圖上)
-            if not is_text_black(img_np, min_x, min_y, p_w, p_h):
-                continue
-
-            # 3.【結構過濾】
-            # 條件 A: 是標題 (字體接近最大值)
-            is_title = (p_data['calculated_size'] >= max_font_size_on_page - 2) and (max_font_size_on_page > 14)
-            # 條件 B: 是段落 (行數 >= 2)
-            is_paragraph = len(p_data['line_nums']) >= 2
+            # 2.【屬性判斷】
+            is_bullet = is_list_item(full_text)  # 是否為清單
+            is_black = is_text_black(img_np, min_x, min_y, p_w, p_h) # 是否為黑色
+            is_title = (p_data['calculated_size'] >= max_font_size_on_page - 2) and (max_font_size_on_page > 14) # 是否為標題
+            is_multiline = len(p_data['line_nums']) >= 2 # 是否多行
             
-            if is_title or is_paragraph:
-                # 符合拆解條件：執行拆解！
-                
-                # A. 塗掉背景
+            # 3.【拆解決策樹】
+            should_extract = False
+            
+            if is_bullet:
+                # 規則 A: 如果是清單 -> 不論顏色、不論行數，強制拆解！
+                should_extract = True
+            elif is_black:
+                # 規則 B: 如果是黑色 -> 標題或多行才拆，單行不拆
+                if is_title or is_multiline:
+                    should_extract = True
+            
+            # 4.【執行動作】
+            if should_extract:
+                # 塗掉背景
                 bg_color = get_smart_median_color(img_np, min_x, min_y, p_w, p_h)
                 cv2.rectangle(clean_bg_img, (min_x-2, min_y-2), (max_x2+2, max_y2+2), bg_color, -1)
                 
-                # B. 記錄下來，等下建立 PPT 文字框
+                # 標記要轉文字框
                 p_data['should_export'] = True
                 p_data['bbox'] = (min_x, min_y, p_w, p_h)
             else:
-                # 單行小字 (圖表標籤) -> 跳過 (保留在背景)
+                # 保留在圖片上
                 p_data['should_export'] = False
 
         # --- 第四階段：產生 PPT ---
         
-        # 1. 插入處理後的背景
+        # 插入背景
         clean_bg_rgb = cv2.cvtColor(clean_bg_img, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(clean_bg_rgb)
         img_stream = io.BytesIO()
@@ -210,7 +222,7 @@ def process_pdf(uploaded_file):
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         slide.shapes.add_picture(img_stream, 0, 0, width=prs.slide_width, height=prs.slide_height)
         
-        # 2. 建立文字框 (只建立有標記 should_export 的)
+        # 建立文字框
         scale_x = prs.slide_width / img_w
         scale_y = prs.slide_height / img_h
         
@@ -239,7 +251,6 @@ def process_pdf(uploaded_file):
                     paragraph.font.name = "Arial"
                     paragraph.font.color.rgb = RGBColor(0, 0, 0)
                     
-                    # 標題加粗
                     if (this_font_size >= max_font_size_on_page - 2) and (max_font_size_on_page > 14):
                         paragraph.font.bold = True
                     else:
