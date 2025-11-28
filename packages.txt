@@ -5,3 +5,4 @@ poppler-utils
 ffmpeg
 libsm6
 libxext6
+libgl1
