@@ -1,4 +1,3 @@
-cat << 'EOF' > app.py
 import streamlit as st
 import cv2
 import numpy as np
@@ -268,4 +267,3 @@ if uploaded_file is not None:
         except Exception as e:
             st.error(f"❌ 錯誤：{e}")
             st.info("💡 提示：如果線上報錯，請檢查 requirements.txt 是否包含 opencv-python-headless。")
-EOF
